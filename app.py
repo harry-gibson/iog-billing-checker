@@ -5,6 +5,7 @@ Run locally with:  streamlit run app.py
 
 from __future__ import annotations
 
+import io
 import sys
 from datetime import time
 from pathlib import Path
@@ -25,9 +26,7 @@ RED, GREEN, BLUE, GOLD = "#d62728", "#2ca02c", "#1f77b4", "#ffd54f"
 @st.cache_data(show_spinner=False)
 def run_analysis(octopus_bytes, charger_bytes, charger_col, dayfirst, cfg_values):
     cfg = analysis.Settings(**cfg_values)
-    import io
-
-    octopus_src = io.BytesIO(octopus_bytes)
+    octopus_src = [io.BytesIO(b) for b in octopus_bytes]
     charger_src = io.BytesIO(charger_bytes) if charger_bytes else None
     return analysis.analyse(octopus_src, charger_src, cfg, charger_col, dayfirst)
 
@@ -41,13 +40,14 @@ def gold_bands(fig: go.Figure, window: pd.DataFrame, top: float, threshold: floa
 
 
 def case_study_figure(window: pd.DataFrame, title: str, rate_threshold: float,
-                      low_rate: float) -> go.Figure:
+                      low_rate: float, has_ev_split: bool = True) -> go.Figure:
     slot_ms = 30 * 60 * 1000  # bars span their whole half hour, starting at the slot's timestamp
     fig = go.Figure()
-    fig.add_bar(x=window.index, y=window["home_kw"], name='Octopus "home"', marker_color=RED,
-                width=slot_ms, offset=0)
-    fig.add_bar(x=window.index, y=window["ev_kw"], name='Octopus "EV"', marker_color=GREEN,
-                width=slot_ms, offset=0)
+    fig.add_bar(x=window.index, y=window["home_kw"], width=slot_ms, offset=0, marker_color=RED,
+                name='Octopus "home"' if has_ev_split else "Metered consumption")
+    if has_ev_split:
+        fig.add_bar(x=window.index, y=window["ev_kw"], name='Octopus "EV"', marker_color=GREEN,
+                    width=slot_ms, offset=0)
     if window["charger_kwh"].notna().any():
         fig.add_scatter(x=window.index, y=window["charger_kwh"] * 2, name="Charger's own log",
                         mode="lines", line=dict(color=BLUE, width=2.5, shape="hv"))
@@ -73,14 +73,18 @@ def case_study_figure(window: pd.DataFrame, title: str, rate_threshold: float,
 
 st.title("⚡ Intelligent Octopus Go billing checker")
 st.caption(
-    "Looks for half hours where the 'home' consumption may be too high to be genuine household load "
-    "but was still charged at the standard rate - the signature of EV charging being recorded "
-    "out of step with the off-peak window that was created for it."
+    "Looks for half hours where the 'home' consumption may be too high to be genuine household load (and therefore was probably caused by the EV charging) "
+    "but was still identified as 'home' use and charged at the peak rate - the signature of EV charging being recorded "
+    "out of step with the off-peak window that was created for it.  This analysis assumes you have not used the 'Bump Charge' feature!"
 )
 
 with st.sidebar:
     st.header("1. Your data")
-    octopus_file = st.file_uploader("Octopus half-hourly export (CSV)", type="csv")
+    octopus_files = st.file_uploader("Octopus half-hourly export (CSV)", type="csv",
+                                     accept_multiple_files=True,
+                                     help="Add more than one to cover a longer period. Both the newer "
+                                          "home/EV split export and the older consumption-only export "
+                                          "are accepted, and they can be mixed.")
     charger_file = st.file_uploader("Charger export (CSV, optional)", type="csv",
                                     help="A myenergi-style hourly export. Optional, but it corroborates "
                                          "when the car was actually drawing power.")
@@ -107,22 +111,27 @@ with st.sidebar:
     st.divider()
     st.caption("Your files are processed in memory for this session only.")
 
-if octopus_file is None:
+if not octopus_files:
     st.info("Upload your Octopus export in the sidebar to begin.")
     with st.expander("What do I need, and where do I get it?"):
         st.markdown(
             """
 **Octopus export (required).** From your Octopus account, download the half-hourly usage CSV for
-an Intelligent Octopus Go meter. This is found on the new "Home and EV Data" page, at the bottom under "Get your energy geek on". It needs these columns:
+an Intelligent Octopus Go meter. There are two places this can be found:
+1. The new "Home and EV Data" page, at the bottom under "Get your energy geek on". This data will contain Octopus's version of usage that was allocated as EV vs Home usage, with the following
+ columns necessary for the analysis: `Home Consumption (kWh)`, `Home Unit Rate (p)`, `EV Consumption (kWh)`, `EV Unit Rate (p)`, `Start`, `End` plus two estimated cost columns. Data are only available 
+ in this format if you have the "charge cap" active for your account, and only for periods since it was switched on.
 
-`Home Consumption (kWh)`, `Home Unit Rate (p)`, `EV Consumption (kWh)`, `EV Unit Rate (p)`,
-`Start`, `End` - plus the two estimated cost columns if you want the cost figures.
+2. The "my energy insights" page, at the bottom, under "Get your energy geek on". This allows you to export data for periods before the charge cap was active. It provides
+a simpler file with `Consumption (kWh)`, `Estimated Cost Inc. Tax (p)`, `Standing Charge Inc. Tax (p)`, `Start`, `End`
+and no home/EV split. These work too: the unit rate is recovered from cost divided by consumption, and the flagging is done on total consumption instead of the home share. 
+If you use these files then you won't be able to separate Octopus's home vs EV consumption on the graph which might make the results harder to interpret conclusively. 
 
-The download available from the "my energy insights" page is NOT the correct one; you need the export from the "Home and EV Data" page.
+You can upload several files at once to build a continuous history - where they overlap, the split format wins.
 
 **Charger export (optional).** A myenergi hourly graph export, with a `Timestamp` column, a device
 column such as `Zappi 12345678 (kW)`, and a `Home (kW)` column. Any charger export with the same
-shape will work; you can pick which column is the charger.
+shape will work; you can pick which column is the charger. I've only tried this with myenergi exports.
 
 Unit rates are read from your own file, so this works whatever your tariff rates are.
             """
@@ -138,7 +147,7 @@ cfg_values = dict(
 )
 
 try:
-    result = run_analysis(octopus_file.getvalue(),
+    result = run_analysis(tuple(f.getvalue() for f in octopus_files),
                           charger_file.getvalue() if charger_file else None,
                           charger_col, dayfirst, cfg_values)
 except Exception as exc:  # surface parsing problems rather than a stack trace
@@ -147,6 +156,7 @@ except Exception as exc:  # surface parsing problems rather than a stack trace
 
 summary = result["summary"]
 combined = result["combined"]
+has_ev_split = result["has_ev_split"]
 rate_threshold = (summary["low_rate_p"] + summary["high_rate_p"]) / 2
 has_charger = combined["charger_kwh"].notna().any()
 
@@ -180,8 +190,11 @@ with tab_cases:
             f"**{int((~days['daytime_charge']).sum())}** were excluded for having no charging evidence."
         )
         st.caption(
-            "Red is what Octopus billed as household load, green what it billed as EV, blue is the "
-            "charger's own record, and the yellow band is when the off-peak rate actually applied. Black triangles mark the suspect slots." \
+            ("Red is what Octopus billed as household load, green what it billed as EV, blue is the "
+             if has_ev_split else
+             "Red is the metered consumption (this export has no home/EV split), blue is the ")
+            + "charger's own record. Black triangles mark the suspect slots. Yellow highlights the slots that were billed as off-peak by Octopus. "
+            + "If you have not used Bump Charge, and have Charge Cap active, these slots should always align with the high consumption bars indicating consumption by the EV charger."
             "Zappi data are hourly so peaks may appear smoothed compared to the half-hourly Octopus data."
         )
         for _, row in qualifying.iterrows():
@@ -189,8 +202,9 @@ with tab_cases:
             evidence = "charger log" if row["by_charger"] else "meter only"
             title = (f"{row['day'].date()} - {int(row['slots'])} slot(s), {row['kwh']:.1f} kWh, "
                      f"£{row['overpayment_gbp']:.2f} overpaid ({evidence})")
-            st.plotly_chart(case_study_figure(window, title, rate_threshold, summary["low_rate_p"]),
-                            width="stretch")
+            st.plotly_chart(
+                case_study_figure(window, title, rate_threshold, summary["low_rate_p"], has_ev_split),
+                width="stretch")
 
 with tab_timing:
     st.markdown("#### Is the consumption data out of step with the tariff?")
@@ -203,7 +217,9 @@ with tab_timing:
     fig = go.Figure()
     fig.add_bar(x=oo["shift_min"], y=oo["kwh_in_triggered_windows"], name="Triggered off-peak windows",
                 marker_color=GREEN)
-    fig.add_bar(x=oo["shift_min"], y=oo["kwh_in_ev_slots"], name="EV-flagged slots", marker_color=BLUE)
+    if has_ev_split:
+        fig.add_bar(x=oo["shift_min"], y=oo["kwh_in_ev_slots"], name="EV-flagged slots",
+                    marker_color=BLUE)
     fig.update_layout(height=380, barmode="group", xaxis_title="consumption series moved later (minutes)",
                       yaxis_title="kWh captured", legend=dict(orientation="h", y=1.02, yanchor="bottom"))
     st.plotly_chart(fig, width="stretch")
@@ -214,10 +230,12 @@ with tab_timing:
     if n_windows:
         st.markdown("#### Load profile around the start of an off-peak window")
         fig = go.Figure()
-        fig.add_scatter(x=profile["offset_min"], y=profile["home_kw"], name='Billed as "home"',
+        fig.add_scatter(x=profile["offset_min"], y=profile["home_kw"],
+                        name='Billed as "home"' if has_ev_split else "Metered consumption",
                         mode="lines+markers", line=dict(color=RED))
-        fig.add_scatter(x=profile["offset_min"], y=profile["ev_kw"], name='Billed as "EV"',
-                        mode="lines+markers", line=dict(color=GREEN))
+        if has_ev_split:
+            fig.add_scatter(x=profile["offset_min"], y=profile["ev_kw"], name='Billed as "EV"',
+                            mode="lines+markers", line=dict(color=GREEN))
         fig.add_vline(x=0, line_dash="dash", annotation_text="off-peak starts")
         fig.update_layout(height=380, xaxis_title="minutes relative to the start of the window",
                           yaxis_title="mean kW", legend=dict(orientation="h", y=1.02, yanchor="bottom"))
@@ -248,9 +266,12 @@ with tab_slots:
     else:
         table = mis[["start", "home_kwh", "home_kw", "ev_kwh", "home_rate_p",
                      "home_cost_p", "overpayment_gbp"]].copy()
+        if not has_ev_split:
+            table = table.drop(columns="ev_kwh")
         table["start"] = table["start"].dt.strftime("%Y-%m-%d %H:%M")
         table = table.rename(columns={
-            "start": "Slot", "home_kwh": "Home kWh", "home_kw": "Home kW", "ev_kwh": "EV kWh",
+            "start": "Slot", "home_kwh": "Home kWh" if has_ev_split else "kWh",
+            "home_kw": "Home kW" if has_ev_split else "kW", "ev_kwh": "EV kWh",
             "home_rate_p": "Rate (p)", "home_cost_p": "Charged (p)", "overpayment_gbp": "Overpaid (£)",
         })
         st.dataframe(table.round(3), width="stretch", hide_index=True)

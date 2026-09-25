@@ -33,6 +33,19 @@ Then upload your Octopus half-hourly export, and optionally a myenergi-style cha
 Unit rates, the charger column and the date format are read from your files, so it is not tied to
 one tariff or one household.
 
+### Export formats
+
+Both Octopus half-hourly formats are accepted and auto-detected:
+
+- **Split format** (from roughly mid-July 2026): `Home Consumption (kWh)`, `Home Unit Rate (p)`,
+  `EV Consumption (kWh)`, `EV Unit Rate (p)`.
+- **Total-only format** (older): `Consumption (kWh)`, `Estimated Cost Inc. Tax (p)`,
+  `Standing Charge Inc. Tax (p)`. There is no published unit rate, so it is recovered as
+  cost / consumption, and flagging runs against total consumption rather than the home share.
+
+Several files can be uploaded at once to build a continuous history. They are merged on slot
+timestamp; where periods overlap the split format wins.
+
 ## Deploy it for others
 
 Push this repo to GitHub and point [share.streamlit.io](https://share.streamlit.io) at `app.py`.

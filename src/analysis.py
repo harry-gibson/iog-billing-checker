@@ -57,23 +57,71 @@ def _match_octopus_columns(columns) -> dict:
 
 
 def read_octopus(src, tz: str = DEFAULT_TZ) -> pd.DataFrame:
-    """Half-hourly Octopus export with the home/EV split and the unit rate applied to each slot."""
+    """Half-hourly Octopus export, in either the home/EV split format or the older total-only one.
+
+    Accepts a single source or a list of them, so an older export can be joined onto a newer one.
+    """
+    if isinstance(src, (list, tuple)):
+        return _merge_octopus([read_octopus(s, tz) for s in src])
+
     df = pd.read_csv(src, skipinitialspace=True)
     df.columns = [c.strip() for c in df.columns]
-    df = df.rename(columns=_match_octopus_columns(df.columns))
+    keys = [c.lower() for c in df.columns]
 
+    if any(k.startswith("home consumption") for k in keys):
+        return _read_octopus_split(df, tz)
+    if any(k.startswith("consumption") for k in keys):
+        return _read_octopus_total(df, tz)
+    raise ValueError(
+        "Unrecognised Octopus export: expected a 'Home Consumption (kWh)' column (newer split "
+        f"format) or a 'Consumption (kWh)' column (older format). Found: {list(df.columns)}"
+    )
+
+
+def _read_octopus_split(df: pd.DataFrame, tz: str) -> pd.DataFrame:
+    df = df.rename(columns=_match_octopus_columns(df.columns))
     missing = {"home_kwh", "ev_kwh", "home_rate_p", "start"} - set(df.columns)
     if missing:
         raise ValueError(f"Octopus export is missing expected columns: {sorted(missing)}")
+    for col in ("home_cost_p", "ev_cost_p", "ev_rate_p"):
+        if col not in df.columns:
+            df[col] = np.nan
+    return _finalise_octopus(df, tz, has_ev_split=True)
 
+
+def _read_octopus_total(df: pd.DataFrame, tz: str) -> pd.DataFrame:
+    """Older export: one consumption figure, no home/EV split and no published unit rate."""
+    rename = {}
+    for col in df.columns:
+        key = col.strip().lower()
+        if key.startswith("consumption"):
+            rename[col] = "home_kwh"
+        elif key.startswith("estimated cost"):
+            rename[col] = "home_cost_p"
+        elif key == "start":
+            rename[col] = "start"
+        elif key == "end":
+            rename[col] = "end"
+    df = df.rename(columns=rename)
+
+    missing = {"home_kwh", "home_cost_p", "start"} - set(df.columns)
+    if missing:
+        raise ValueError(f"Octopus export is missing expected columns: {sorted(missing)}")
+
+    df["ev_kwh"] = 0.0
+    df["ev_cost_p"] = 0.0
+    df["ev_rate_p"] = np.nan
+    # The unit rate is not published in this format, so recover it from cost / consumption.
+    rate = df["home_cost_p"] / df["home_kwh"].replace(0, np.nan)
+    df["home_rate_p"] = rate.ffill().bfill()
+    return _finalise_octopus(df, tz, has_ev_split=False)
+
+
+def _finalise_octopus(df: pd.DataFrame, tz: str, has_ev_split: bool) -> pd.DataFrame:
     df["start"] = pd.to_datetime(df["start"], format="ISO8601", utc=True).dt.tz_convert(tz)
     if "end" in df.columns:
         df["end"] = pd.to_datetime(df["end"], format="ISO8601", utc=True).dt.tz_convert(tz)
     df = df.sort_values("start").reset_index(drop=True)
-
-    for col in ("home_cost_p", "ev_cost_p", "ev_rate_p"):
-        if col not in df.columns:
-            df[col] = np.nan
 
     df["total_kwh"] = df["home_kwh"] + df["ev_kwh"]
     df["total_cost_p"] = df["home_cost_p"].fillna(0) + df["ev_cost_p"].fillna(0)
@@ -83,15 +131,42 @@ def read_octopus(src, tz: str = DEFAULT_TZ) -> pd.DataFrame:
 
     low, high = detect_rates(df)
     df["cheap"] = df["home_rate_p"] <= (low + high) / 2
+    df.attrs["has_ev_split"] = has_ev_split
     return df
 
 
+def _merge_octopus(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate exports, preferring the split format wherever their periods overlap."""
+    tagged = []
+    for frame in frames:
+        frame = frame.copy()
+        frame["_split"] = bool(frame.attrs.get("has_ev_split", True))
+        tagged.append(frame)
+    merged = (pd.concat(tagged, ignore_index=True)
+              .sort_values(["start", "_split"])
+              .drop_duplicates(subset="start", keep="last")
+              .reset_index(drop=True))
+    has_ev_split = bool(merged["_split"].any())
+    merged = merged.drop(columns="_split")
+    merged.attrs["has_ev_split"] = has_ev_split
+    return merged
+
+
 def detect_rates(oct_df: pd.DataFrame) -> tuple[float, float]:
-    """Off-peak and standard unit rates, taken from the data rather than assumed."""
-    rates = pd.unique(oct_df["home_rate_p"].dropna())
-    if len(rates) == 0:
+    """Off-peak and standard unit rates, taken from the data rather than assumed.
+
+    Uses the median of each cluster so a rate recovered from cost / consumption is not thrown
+    off by rounding noise in a single slot.
+    """
+    rates = oct_df["home_rate_p"].replace([np.inf, -np.inf], np.nan).dropna()
+    if rates.empty:
         raise ValueError("No unit rates found in the Octopus export.")
-    return float(np.min(rates)), float(np.max(rates))
+    low, high = float(rates.min()), float(rates.max())
+    if high - low < 1e-6:
+        return low, high
+    midpoint = (low + high) / 2
+    return float(rates[rates <= midpoint].median()), float(rates[rates > midpoint].median())
+
 
 
 def charger_column_options(src) -> list[str]:
@@ -248,6 +323,9 @@ def octopus_only_offset(oct_df: pd.DataFrame, cfg: Settings, max_slots: int = 8)
     ev_flagged = (df["ev_kwh"] > 0.05).values
 
     quiet = df.loc[df["ev_kwh"].rolling(9, center=True, min_periods=1).max() == 0, "total_kwh"]
+    if (df["ev_kwh"] > 0).sum() == 0:
+        # No EV column to steer by, so treat anything below the implausible threshold as baseline.
+        quiet = df.loc[df["total_kwh"] * 2 < cfg.implausible_kw, "total_kwh"]
     baseline = float(quiet.median()) if len(quiet) else 0.0
     excess = np.clip(df["total_kwh"].to_numpy() - baseline, 0, None)
 
@@ -325,6 +403,7 @@ def analyse(octopus_src, charger_src=None, cfg: Settings | None = None,
     """One-shot entry point returning every frame the notebook or app needs."""
     cfg = cfg or Settings()
     oct_df = read_octopus(octopus_src, cfg.tz)
+    has_ev_split = bool(oct_df.attrs.get("has_ev_split", True))
     charger_df = read_charger(charger_src, cfg.tz, charger_col, dayfirst) if charger_src is not None else None
 
     flagged = flag_misbilled(oct_df, cfg)
@@ -335,6 +414,7 @@ def analyse(octopus_src, charger_src=None, cfg: Settings | None = None,
         "octopus": flagged,
         "charger": charger_df,
         "combined": combined,
+        "has_ev_split": has_ev_split,
         "summary": cost_summary(flagged, cfg),
         "offset_scan": offset_scan(combined),
         "octopus_only_offset": octopus_only_offset(flagged, cfg),
